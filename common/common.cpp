@@ -2508,33 +2508,57 @@ common_checkpoint_spare::~common_checkpoint_spare() {
 }
 
 void common_checkpoint_spare::resize(std::vector<uint8_t> & data, size_t size) {
-    const size_t floor_bytes = (size_t) 16 << 20;   // small states: nothing to gain
     if (size < floor_bytes || data.capacity() >= size) {
         data.resize(size);
         return;
     }
-    std::unique_lock<std::mutex> lock(mu);
-    if (!busy && buf.capacity() >= size) {
-        data.swap(buf);
-        std::vector<uint8_t>().swap(buf);
-    }
-    if (!busy) {
-        if (worker.joinable()) {
+    {
+        std::unique_lock<std::mutex> lock(mu);
+        if (busy) {
+            // a request right behind the previous one: the rest of the spare's preparation is shorter than a fresh
+            // buffer's
+            lock.unlock();
             worker.join();
+            lock.lock();
         }
-        busy = true;
         // the states of a context differ by ~2 MiB (113.7 to 116.0 MiB seen): the largest one seen fits them all
         largest = std::max(largest, size);
-        const size_t n = largest + ((size_t) 1 << 20);
-        worker = std::thread([this, n] {
-            std::vector<uint8_t> fresh(n);
-            std::lock_guard<std::mutex> l(mu);
-            buf.swap(fresh);
-            busy = false;
-        });
+        const bool spare = buf.capacity() >= size;
+        if (spare) {
+            data.swap(buf);
+        }
+        LOG_TRC("%s: checkpoint buffer of %.1f MiB: %s\n", __func__, size / 1048576.0, spare ? "the spare one" : "a fresh one");
+        std::vector<uint8_t>().swap(buf);   // taken, or too small: the next one is prepared or recycled
     }
-    lock.unlock();
     data.resize(size);
+}
+
+void common_checkpoint_spare::prepare() {
+    std::lock_guard<std::mutex> lock(mu);
+    if (busy || largest == 0 || buf.capacity() > 0) {
+        return;
+    }
+    if (worker.joinable()) {
+        worker.join();   // done (busy is false): returns at once
+    }
+    busy = true;
+    const size_t n = largest + ((size_t) 1 << 20);
+    worker = std::thread([this, n] {
+        std::vector<uint8_t> fresh(n);
+        std::lock_guard<std::mutex> l(mu);
+        buf.swap(fresh);
+        busy = false;
+    });
+}
+
+void common_checkpoint_spare::recycle(std::vector<uint8_t> & data) {
+    if (data.capacity() < floor_bytes) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    if (!busy && buf.capacity() == 0 && data.capacity() >= largest) {
+        buf.swap(data);
+    }
 }
 
 void common_prompt_checkpoint::update_tgt(

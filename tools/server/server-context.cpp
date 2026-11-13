@@ -1048,6 +1048,21 @@ private:
     size_t ckpt_pending_size = 0;
     int ckpt_pending_slot = -1;
 
+    // after a checkpoint of this slot took the spare buffer: the next one is prepared now
+    // - with several slots: a request may come while another's answer is generated, before any answer ends;
+    // - in a prompt still being evaluated (a long one has several checkpoints): its last checkpoint takes one after the
+    //   first token.
+    // Else (one slot, its answer being generated) when the answer is done (callback_on_reset), not beside its steps
+    void checkpoint_spare_refill(int id_slot) {
+        bool now = slots.size() > 1;
+        for (auto & slot : slots) {
+            now = now || (slot.id == id_slot && slot.state == SLOT_STATE_PROCESSING_PROMPT);
+        }
+        if (now) {
+            ckpt_spare.prepare();
+        }
+    }
+
     void checkpoint_finish() {
         if (!ckpt_pending) {
             return;
@@ -1061,6 +1076,7 @@ private:
                 slot.prompt.checkpoints.remove_if([cur](const common_prompt_checkpoint & c) { return &c == cur; });
             }
         }
+        checkpoint_spare_refill(ckpt_pending_slot);
     }
 
     // context checkpoints inside a prompt batch (llama_set_seq_snapshots): the batch is no longer ended where a
@@ -1545,6 +1561,8 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+                // the next checkpoint's buffer, once an answer is done: with one slot nothing is generated then
+                ckpt_spare.prepare();
             };
 
             slot.reset();
@@ -2659,6 +2677,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                ckpt_spare.recycle(it->data_tgt);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2674,6 +2693,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            ckpt_spare.recycle(slot.prompt.checkpoints.front().data_tgt);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2683,6 +2703,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    ckpt_spare.recycle(it->data_tgt);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2708,6 +2729,7 @@ private:
             ckpt_pending_slot = slot.id;
         } else {
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &ckpt_spare);
+            checkpoint_spare_refill(slot.id);
         }
         // a checkpoint from a snapshot takes the draft's state after the whole batch: a restore removes the later
         // positions (seq_rm) after loading it
@@ -3673,6 +3695,7 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &ckpt_spare);
+                    checkpoint_spare_refill(slot.id);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -4022,6 +4045,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        ckpt_spare.recycle(it->data_tgt);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;

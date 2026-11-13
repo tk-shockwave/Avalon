@@ -1302,17 +1302,26 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // A checkpoint's buffer taken ready instead of allocated. A fresh allocation of ~115 MiB (Qwen3.8's recurrent state)
 // takes ~50 ms to touch for the first time (29 000 page faults, as long by a memset, by the copy or prefaulted), at
 // every request, before its ~22 ms copy from the device; transparent huge pages cut it to 8 ms but stalled up to
-// 1.2 s once the RAM was full (direct compaction). So one spare buffer is kept touched ahead of time by a thread, while
-// the answer is generated: resize() gives it to the checkpoint and the thread prepares the next one. No spare of
-// that size ready (the first requests): a fresh buffer, as before. Standard C++ only (it serves Windows as Linux);
-// owned by who makes the checkpoints (the server), which joins the thread when it goes
+// 1.2 s once the RAM was full (direct compaction). So one spare buffer is kept ready: resize() gives it to the checkpoint;
+// the next one is the buffer of a checkpoint that goes (recycle()), else one touched by a thread once the answer is done
+// (prepare(): beside the answer's steps it cost them ~1 %). No spare of that size (the first request): a fresh
+// buffer, as before. Standard C++ only (it serves Windows as Linux); owned by who makes the checkpoints (the server),
+// which joins the thread when it goes
 struct common_checkpoint_spare {
     ~common_checkpoint_spare();
 
     // data resized to size, from the spare when it holds enough
     void resize(std::vector<uint8_t> & data, size_t size);
 
+    // the next spare prepared by a thread, if none is there or on its way: called when an answer is done, so that the
+    // ~50 ms of page faults do not run beside its steps. A request that comes before it is done waits for it
+    void prepare();
+
+    // the buffer of a checkpoint that goes (its pages already there) kept as the spare, if none is there
+    void recycle(std::vector<uint8_t> & data);
+
 private:
+    static constexpr size_t floor_bytes = (size_t) 16 << 20;   // small states: nothing to gain
     std::mutex mu;
     std::vector<uint8_t> buf;
     std::thread worker;
