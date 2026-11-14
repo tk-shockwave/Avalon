@@ -6017,9 +6017,12 @@ struct test_qsa_select_tiles : public test_case {
     const int64_t   n_head_kv;
     const bool      kv_perm;
     const float     q_scale; // > 1: peaked attention scores, as a model's
+    // > 0: the selections of 16 consecutive queries drawn from tile_union selections' worth of pools, all live (a deep
+    // prompt of qwen4exp: 4.3 from 57k cells on); 0: half from a few hot pools, half anywhere, some dead
+    const float     tile_union;
 
     std::string vars() override {
-        return VARS_TO_STR12(n_kv, n_top, kpool, n_t, ncols, by_pos, flash, type_K, type_V, n_head_kv, kv_perm, q_scale);
+        return VARS_TO_STR13(n_kv, n_top, kpool, n_t, ncols, by_pos, flash, type_K, type_V, n_head_kv, kv_perm, q_scale, tile_union);
     }
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return flash ? "FLASH_ATTN_QSA_TILES" : "QSA_SELECT_TILES"; }
@@ -6028,9 +6031,9 @@ struct test_qsa_select_tiles : public test_case {
 
     test_qsa_select_tiles(int64_t n_kv = 4096, int64_t n_top = 64, int64_t kpool = 4, int64_t n_t = 37, int64_t ncols = 16,
             bool by_pos = true, bool flash = false, ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16,
-            int64_t n_head_kv = 1, bool kv_perm = false, float q_scale = 1.0f)
+            int64_t n_head_kv = 1, bool kv_perm = false, float q_scale = 1.0f, float tile_union = 0.0f)
         : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), ncols(ncols), by_pos(by_pos), flash(flash),
-          type_K(type_K), type_V(type_V), n_head_kv(n_head_kv), kv_perm(kv_perm), q_scale(q_scale) {}
+          type_K(type_K), type_V(type_V), n_head_kv(n_head_kv), kv_perm(kv_perm), q_scale(q_scale), tile_union(tile_union) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_sel = n_top*kpool + kpool - 1;
@@ -6081,8 +6084,24 @@ struct test_qsa_select_tiles : public test_case {
             if (strcmp(t->name, "sel") == 0) {
                 std::vector<int32_t> v(ggml_nelements(t));
                 const int64_t n_sel = t->ne[0];
+                std::vector<int32_t> cand;
                 for (int64_t q = 0; q < t->ne[1]; q++) {
+                    if (tile_union > 0.0f) {
+                        if (q % 16 == 0) {
+                            std::vector<int32_t> all(n_kv/kpool);
+                            std::iota(all.begin(), all.end(), 0);
+                            std::shuffle(all.begin(), all.end(), rng);
+                            cand.assign(all.begin(), all.begin() + std::min<int64_t>((int64_t) all.size(), (int64_t) (tile_union*n_top)));
+                        }
+                        std::shuffle(cand.begin(), cand.end(), rng);
+                    }
                     for (int64_t p = 0; p < n_top; p++) {
+                        if (tile_union > 0.0f) {
+                            for (int64_t c = 0; c < kpool; c++) {
+                                v[q*n_sel + p*kpool + c] = cand[p]*(int32_t) kpool + (int32_t) c;
+                            }
+                            continue;
+                        }
                         const int32_t pool = rng() % 2 ? hot[rng() % hot.size()] : (int32_t) (rng() % (n_kv/kpool));
                         for (int64_t c = 0; c < kpool; c++) {
                             v[q*n_sel + p*kpool + c] = rng() % 16 == 0 ? (int32_t) n_kv : pool*(int32_t) kpool + (int32_t) c;
@@ -6096,7 +6115,7 @@ struct test_qsa_select_tiles : public test_case {
             } else if (strcmp(t->name, "score") == 0) {
                 std::vector<float> v(ggml_nelements(t));
                 for (auto & x : v) {
-                    x = rng() % 8 == 0 ? -INFINITY : (float) (rng() % 100);   // some invisible pools
+                    x = tile_union <= 0.0f && rng() % 8 == 0 ? -INFINITY : (float) (rng() % 100);   // some invisible pools
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "kq_mask") == 0) {
@@ -13599,6 +13618,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 8, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
     test_cases.emplace_back(new test_qsa_select_tiles(150016, 512, 4, 333, 8, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
     test_cases.emplace_back(new test_qsa_select_tiles(262144, 2048, 4, 2048, 8, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 8.0f));
+    // a list per query (LLAMA_QSA_TILE_COLS=1): its 12 heads on the 16 columns of (256, 256, 1, 16)
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 1, true, true, GGML_TYPE_F16, GGML_TYPE_F16, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(150016, 512, 4, 333, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 2048, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 8.0f));
+    test_cases.emplace_back(new test_qsa_select_tiles(49152, 512, 4, 8192, 1, true, false));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 1}, 65536, 200, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
 
     // sparse mask + quantized cache
@@ -14004,6 +14029,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // a whole ubatch of the 256k configuration
     test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, 16, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
     test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    // the same with a list per query
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, 1, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    // a deep prompt's selections (union of 16 queries: 4.3 selections), tiles of 16, of 8, and a list per query;
+    // then a shallow one's (9.7k cells: 1.84)
+    for (int64_t cols : { 16, 8, 1 }) {
+        test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, cols, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 1.0f, 4.3f));
+        test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, cols, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, false, 1.0f, 4.3f));
+    }
+    for (int64_t cols : { 16, 1 }) {
+        test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 9536, cols, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 1.0f, 4.3f));
+        test_cases.emplace_back(new test_qsa_select_tiles(32768, 512, 4, 9536, cols, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 1.0f, 3.0f));
+        test_cases.emplace_back(new test_qsa_select_tiles(9728, 512, 4, 9536, cols, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 1.0f, 1.84f));
+    }
 
     // qwen4exp QSA attention while decoding / verifying: 2 KV heads x GQA 12, D 256; dense scan (quantized KV, 256
     // cells) and gathered cells (f16, 2051)

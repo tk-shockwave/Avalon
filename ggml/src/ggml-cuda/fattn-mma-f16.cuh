@@ -139,6 +139,10 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     if (DKQ == 256 && DV == 256 && ncols_key == (64 | FATTN_MMA_CFG_SPARSE)) {
         return fattn_mma_config(256, 6, 32, 32, 32, 32, 1, false);
     }
+    // one query's heads on 16 columns, its own cells (LLAMA_QSA_TILE_COLS=1)
+    if (DKQ == 256 && DV == 256 && ncols_key == (16 | FATTN_MMA_CFG_SPARSE)) {
+        return fattn_mma_config(64, 2, 32, 128, 128, 128, 1, false);
+    }
     const int ncols = ncols_key & ~FATTN_MMA_CFG_SPARSE;
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2,  64,  32,  32,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 1, true);
@@ -1872,7 +1876,8 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
            (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8) ||
            (DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4) || // the prefill tile on RDNA (GQA 12: qwen4exp)
-           (DKQ == 256 && DV == 256 && ncols1 ==  8 && ncols2 == 4);   // its tile of 8 queries (LLAMA_QSA_TILE_COLS=8)
+           (DKQ == 256 && DV == 256 && ncols1 ==  8 && ncols2 == 4) || // its tile of 8 queries (LLAMA_QSA_TILE_COLS=8)
+           (DKQ == 256 && DV == 256 && ncols1 ==  1 && ncols2 == 16);  // one query, its 12 heads on the 16 columns (LLAMA_QSA_TILE_COLS=1)
 }
 
 // the sparse gather reads a q8_0 K and a q4_0 V directly (flash_attn_ext_dequant_chunk), D = 256 (qwen4exp)
@@ -2176,7 +2181,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                     ctx.fattn_private = std::max(ctx.fattn_private, (size_t) attr.localSizeBytes);
                 }
             }
-            const bool tile_shape = DKQ == 256 && DV == 256 && (ncols1 == 16 || ncols1 == 8) && ncols2 == 4 && !V_is_K_view;
+            const bool tile_shape = DKQ == 256 && DV == 256 && ((ncols1 == 16 || ncols1 == 8) && ncols2 == 4 || ncols1 == 1 && ncols2 == 16) && !V_is_K_view;
             const bool kv_quant_sparse = tile_shape && ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(cc, dst);
             // a tile mask (ggml_qsa_select_tiles) brings the lists of the sparse gather: always sparse
             const ggml_tensor * mask_t = dst->src[3];

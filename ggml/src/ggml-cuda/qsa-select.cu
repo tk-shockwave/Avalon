@@ -201,6 +201,94 @@ static __global__ void k_qsa_tile_mask(const int32_t * __restrict__ sel, const f
     }
 }
 
+// A list per query (ggml_qsa_select_tiles of 1, read by the attention of one query): a block per query, as many as the
+// batch has tokens where the tiles of 16 have a sixteenth. The same bitmap of the context, read in one round: a thread
+// counts its own run of words, one scan over the block places it, it writes its cells (the tile kernel scans the words
+// a block's width at a time: 16 rounds of 3 barriers at 262k cells).
+static __global__ void k_qsa_query_rows(const int32_t * __restrict__ sel, const float * __restrict__ top_score,
+        int32_t * __restrict__ lists, const int64_t n_sel, const int64_t n_top, const int64_t n_kv, const int32_t kpool,
+        const int64_t s_sel, const int64_t s_score, const int64_t n_t, const int64_t n_list) {
+    extern __shared__ uint32_t bits[];
+    __shared__ int32_t warp_sums[qsa_tiles_threads / 32 + 1];
+    const int64_t t = blockIdx.x;
+    const int n_words = (int) ((n_kv + 31) / 32);
+    const int per     = (n_words + (int) blockDim.x - 1) / (int) blockDim.x;   // words a thread, in a run
+    const int w0      = threadIdx.x*per;
+    for (int w = w0; w < min(n_words, w0 + per); w++) {
+        bits[w] = 0;
+    }
+    __syncthreads();
+    for (int64_t j = threadIdx.x; j < n_sel; j += blockDim.x) {
+        const int32_t c = sel[t*s_sel + j];
+        if (c >= 0 && c < n_kv && (j >= n_top*kpool || top_score[t*s_score + j/kpool] != -INFINITY)) {
+            atomicOr(&bits[c >> 5], 1u << (c & 31));
+        }
+    }
+    __syncthreads();
+    int cnt = 0;
+    for (int w = w0; w < min(n_words, w0 + per); w++) {
+        cnt += __popc(bits[w]);
+    }
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    int incl = cnt;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xFFFFFFFF, incl, o, 32);
+        if (lane >= o) {
+            incl += v;
+        }
+    }
+    if (lane == 31) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int k = 0; k < (int) (blockDim.x / 32); k++) {
+            const int v = warp_sums[k];
+            warp_sums[k] = acc;
+            acc += v;
+        }
+        warp_sums[blockDim.x / 32] = acc;
+    }
+    __syncthreads();
+    int32_t * l = lists + n_list*t;
+    int pos = warp_sums[warp] + incl - cnt;
+    for (int w = w0; w < min(n_words, w0 + per); w++) {
+        uint32_t rest = bits[w];
+        while (rest) {
+            const int b = __ffs(rest) - 1;
+            rest &= rest - 1;
+            if (pos < n_list) {
+                l[pos] = w*32 + b;
+            }
+            pos++;
+        }
+    }
+    __syncthreads();
+    const int32_t count = (int32_t) min((int64_t) warp_sums[blockDim.x / 32], n_list);
+    const int32_t pad = ~(count > 0 ? l[count - 1] : 0);
+    for (int64_t i = count + threadIdx.x; i < n_list; i += blockDim.x) {
+        l[i] = pad;
+    }
+    if (threadIdx.x == 0) {
+        lists[n_list*n_t + t] = count;
+    }
+}
+
+// Its mask: every cell of a query's list is one it chose, its visibility at its place; -inf past the list's count
+template <bool by_pos>
+static __global__ void k_qsa_query_mask(const int32_t * __restrict__ lists, const void * __restrict__ vis,
+        const int32_t * __restrict__ tok_pos, half * __restrict__ dst, const int64_t s_mask, const int64_t n_t, const int64_t n_list) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_list*n_t) {
+        return;
+    }
+    const int64_t t = i / n_list;
+    const int32_t c = lists[i];
+    dst[i] = i % n_list < lists[n_list*n_t + t] ? qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, c) : __float2half(-INFINITY);
+}
+
 // GGML_CUDA_QSA_TILE_STATS=2 (diagnostic, synchronizes: run with GGML_CUDA_DISABLE_GRAPHS=1): the union of the
 // selections (the cells the tile lists take) of groups of g consecutive queries, in selections of one query
 static void qsa_tile_union_stats(ggml_backend_cuda_context & ctx, const ggml_tensor * sel, const ggml_tensor * top_score,
@@ -285,10 +373,24 @@ static void qsa_select_tiles(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(k_qsa_tile_rows<true>),  cudaFuncAttributeMaxDynamicSharedMemorySize, (qsa_tiles_max_kv/32)*sizeof(uint32_t)));
             smem_raised = true;
         }
-        const auto kernel = by_pos ? k_qsa_tile_rows<true> : k_qsa_tile_rows<false>;
-        kernel<<<(unsigned) n_tiles, qsa_tiles_threads, smem, stream>>>((const int32_t *) sel->data, (const float *) top_score->data,
-            (int32_t *) dst->data, sel->ne[0], top_score->ne[0], n_kv, kpool, s_sel, s_score, n_t, ncols, n_list, n_tiles);
+        if (ncols == 1) {
+            static bool query_smem_raised = false;
+            if (!query_smem_raised) {
+                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(k_qsa_query_rows), cudaFuncAttributeMaxDynamicSharedMemorySize, (qsa_tiles_max_kv/32)*sizeof(uint32_t)));
+                query_smem_raised = true;
+            }
+            k_qsa_query_rows<<<(unsigned) n_t, qsa_tiles_threads, smem, stream>>>((const int32_t *) sel->data, (const float *) top_score->data,
+                (int32_t *) dst->data, sel->ne[0], top_score->ne[0], n_kv, kpool, s_sel, s_score, n_t, n_list);
+        } else {
+            const auto kernel = by_pos ? k_qsa_tile_rows<true> : k_qsa_tile_rows<false>;
+            kernel<<<(unsigned) n_tiles, qsa_tiles_threads, smem, stream>>>((const int32_t *) sel->data, (const float *) top_score->data,
+                (int32_t *) dst->data, sel->ne[0], top_score->ne[0], n_kv, kpool, s_sel, s_score, n_t, ncols, n_list, n_tiles);
+        }
         qsa_tile_union_stats(ctx, sel, top_score, n_kv, kpool);
+    } else if (ncols == 1) {
+        const auto kernel = by_pos ? k_qsa_query_mask<true> : k_qsa_query_mask<false>;
+        kernel<<<(unsigned) ((n_list*n_t + 255) / 256), 256, 0, stream>>>((const int32_t *) dst->src[4]->data, vis->data,
+            tok_pos ? (const int32_t *) tok_pos->data : nullptr, (half *) dst->data, s_mask, n_t, n_list);
     } else {
         const dim3 grid((unsigned) n_tiles, (unsigned) ncols, 1);
         const auto kernel = by_pos ? k_qsa_tile_mask<true> : k_qsa_tile_mask<false>;

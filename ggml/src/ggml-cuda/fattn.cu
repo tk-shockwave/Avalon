@@ -166,11 +166,18 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // defined(GGML_USE_MUSA)
 }
 
+bool ggml_cuda_qattn_i8_applies(const int cc, const ggml_tensor * dst);
+void ggml_cuda_qattn_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 bool ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(const int cc, const ggml_tensor * dst) {
 #if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst);
     return false;
 #else
+    // the int8 kernel of one query (qattn-i8.cu) reads the rows as they are stored, at any depth
+    if (ggml_cuda_qattn_i8_applies(cc, dst)) {
+        return true;
+    }
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -200,7 +207,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(const int cc, const ggml_t
         K->ne[1] >= 65536 &&
         gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
-        (tiles ? (mask->ne[1] == 16 || mask->ne[1] == 8) : mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1);
+        (tiles ? (mask->ne[1] == 16 || mask->ne[1] == 8 || mask->ne[1] == 1) : mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1);
 #endif // defined(GGML_USE_MUSA)
 }
 
@@ -280,6 +287,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         if (mask->ne[1] == 8) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 4>(ctx, dst);
             return;
+        }
+        // a list per query (LLAMA_QSA_TILE_COLS=1): (256, 256, 1, 16), the query's heads on the columns (12 of 16 for a
+        // ratio of 12), its own cells read once for all of them
+        if (mask->ne[1] == 1) {
+            if constexpr (DKQ == 256 && DV == 256) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 16>(ctx, dst);
+                return;
+            }
+            GGML_ABORT("fatal error");
         }
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
         return;
@@ -722,7 +738,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
         const bool ok = ggml_cuda_fattn_tile_mask_arch(cc) && gqa_opt_applies && logit_softcap == 0.0f && K->ne[0] == 256 && V->ne[0] == 256 &&
-            gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 && (mask->ne[1] == 16 || mask->ne[1] == 8);
+            gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 && (mask->ne[1] == 16 || mask->ne[1] == 8 || mask->ne[1] == 1);
         return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
@@ -906,6 +922,12 @@ static void ggml_cuda_qsa_tile_stats(ggml_backend_cuda_context & ctx, const ggml
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     ggml_cuda_qsa_tile_stats(ctx, dst);
+    // a list per query over a q8_0 / q4_0 K/V: the int8 kernel (not for a size query: it has no scratch to report)
+    if (!g_fattn_scratch_query && ggml_cuda_qattn_i8_applies(ggml_cuda_info().devices[ctx.device].cc, dst) &&
+            ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst) == BEST_FATTN_KERNEL_MMA_F16) {
+        ggml_cuda_qattn_i8(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

@@ -9346,7 +9346,14 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+void ggml_cuda_qattn_i8_bench(int device);
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
+    // the bench of the int8 QSA attention kernel (qattn-i8.cu), then nothing else
+    if (getenv("GGML_CUDA_QATTN_BENCH")) {
+        ggml_cuda_qattn_i8_bench(device);
+        exit(0);
+    }
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
